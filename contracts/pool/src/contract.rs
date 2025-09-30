@@ -362,6 +362,169 @@ impl PoolContract {
             &blnd_id,
         );
     }
+
+
+       pub fn flash_loan(
+        env: Env,
+        borrower: Address,
+        asset: Address,
+        amount: i128,
+        data: Bytes
+    ) -> Result<(), PoolError> {
+        borrower.require_auth();
+
+        // Check if flash loans are enabled
+        if !Self::flash_loans_enabled(&env) {
+            return Err(PoolError::FlashLoansDisabled);
+        }
+
+        // Check maximum flash loan amount
+        let max_flash_loan = Self::get_max_flash_loan_amount(&env, &asset);
+        if amount > max_flash_loan {
+            return Err(PoolError::FlashLoanAmountTooLarge);
+        }
+
+        // Reentrancy protection
+        if env.storage().instance().has(&DataKey::FlashLoanActive) {
+            return Err(PoolError::ReentrantFlashLoan);
+        }
+
+        env.storage().instance().set(&DataKey::FlashLoanActive, &true);
+
+        // Store pre-flash loan state
+        let initial_balance = token::Client::new(&env, &asset).balance(&env.current_contract_address());
+        let initial_reserves = Self::get_reserves(&env);
+
+        // Calculate flash loan fee
+        let fee = Self::calculate_flash_loan_fee(&env, amount);
+        let amount_with_fee = amount + fee;
+
+        // Store expected repayment amount
+        env.storage().instance().set(&DataKey::ExpectedRepayment, &amount_with_fee);
+
+        // Transfer tokens to borrower
+        token::Client::new(&env, &asset).transfer(&env.current_contract_address(), &borrower, &amount);
+
+        // Call borrower's callback
+        let result = env.try_invoke_contract(
+            &borrower,
+            &symbol_short!("flash_cb"),
+            &(asset.clone(), amount, fee, data)
+        );
+
+        // Check callback executed successfully
+        if result.is_err() {
+            env.storage().instance().remove(&DataKey::FlashLoanActive);
+            env.storage().instance().remove(&DataKey::ExpectedRepayment);
+            return Err(PoolError::FlashLoanCallbackFailed);
+        }
+
+        // Verify repayment
+        let final_balance = token::Client::new(&env, &asset).balance(&env.current_contract_address());
+
+        if final_balance < initial_balance + fee {
+            env.storage().instance().remove(&DataKey::FlashLoanActive);
+            env.storage().instance().remove(&DataKey::ExpectedRepayment);
+            return Err(PoolError::FlashLoanNotRepaid);
+        }
+
+        // Verify pool invariants maintained
+        Self::verify_pool_invariants(&env, &initial_reserves)?;
+
+        // Read-only reentrancy check
+        Self::check_read_only_reentrancy(&env)?;
+
+        // Clean up
+        env.storage().instance().remove(&DataKey::FlashLoanActive);
+        env.storage().instance().remove(&DataKey::ExpectedRepayment);
+
+        emit_flash_loan(&env, borrower, asset, amount, fee);
+        Ok(())
+    }
+
+    /// Verify pool invariants after flash loan
+    fn verify_pool_invariants(
+        env: &Env,
+        initial_reserves: &Map<Address, i128>
+    ) -> Result<(), PoolError> {
+        let final_reserves = Self::get_reserves(env);
+
+        for (asset, initial_amount) in initial_reserves.iter() {
+            if let Some(final_amount) = final_reserves.get(asset.clone()) {
+                // Pool reserves should not decrease (except for legitimate fees)
+                if final_amount < initial_amount {
+                    let decrease = initial_amount - final_amount;
+                    let expected_fee = Self::calculate_flash_loan_fee(env, decrease);
+
+                    if decrease > expected_fee {
+                        return Err(PoolError::PoolInvariantViolated);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check for read-only reentrancy attacks
+    fn check_read_only_reentrancy(env: &Env) -> Result<(), PoolError> {
+        // Verify that view functions return consistent values
+        let stored_total_supply = env.storage().instance().get(&DataKey::TotalSupply).unwrap_or(0);
+        let calculated_total_supply = Self::calculate_total_supply(env);
+
+        if stored_total_supply != calculated_total_supply {
+            return Err(PoolError::ReadOnlyReentrancyDetected);
+        }
+
+        Ok(())
+    }
+
+    /// MEV protection for price-sensitive operations
+    pub fn supply_with_mev_protection(
+        env: Env,
+        from: Address,
+        asset: Address,
+        amount: i128,
+        max_price_impact: u32 // Basis points
+    ) -> Result<(), PoolError> {
+        from.require_auth();
+
+        // Check current price impact
+        let price_impact = Self::calculate_price_impact(&env, &asset, amount);
+
+        if price_impact > max_price_impact {
+            return Err(PoolError::PriceImpactTooHigh);
+        }
+
+        // Check for sandwich attack patterns
+        Self::check_sandwich_attack_protection(&env, &from, &asset, amount)?;
+
+        // Execute supply with additional validations
+        Self::supply(env, from, asset, amount)
+    }
+
+    /// Detect potential sandwich attacks
+    fn check_sandwich_attack_protection(
+        env: &Env,
+        user: &Address,
+        asset: &Address,
+        amount: i128
+    ) -> Result<(), PoolError> {
+        let current_block = env.ledger().sequence();
+
+        // Check for large trades in recent blocks
+        let recent_large_trades = Self::get_recent_large_trades(env, asset, 5); // Last 5 blocks
+
+        for trade in recent_large_trades {
+            // If there was a large trade in the same direction recently, potential front-running
+            if trade.amount > amount / 2 && trade.trader != *user {
+                emit_potential_sandwich_detected(env, user.clone(), asset.clone(), amount);
+                // Could implement delay or rejection here
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[contractimpl]
