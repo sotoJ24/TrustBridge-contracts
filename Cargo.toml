@@ -3,6 +3,8 @@ resolver = "2"
 members = [
   "contracts/tbrg-token",
   "contracts/oracle",
+  "contracts/access-control-manager",
+  "contracts/security-guardian",
   "contracts/pool-factory"
 ]
 
