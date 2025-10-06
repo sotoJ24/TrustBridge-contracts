@@ -5,6 +5,48 @@ pub struct SecurityGuardian;
 #[contractimpl]
 impl SecurityGuardian {
     /// Emergency pause all protocol contracts
+
+    pub fn collect_metrics(env: Env) -> SystemMetrics {
+        SystemMetrics {
+            total_value_locked: Self::calculate_total_tvl(&env),
+            active_users_24h: Self::count_active_users(&env, 86400),
+            transaction_volume_24h: Self::calculate_volume(&env, 86400),
+            health_factor_avg: Self::calculate_avg_health_factor(&env),
+            oracle_price_deviation: Self::calculate_price_deviation(&env),
+            gas_price_avg: Self::calculate_avg_gas_price(&env),
+            timestamp: env.ledger().timestamp(),
+        }
+    }
+
+
+    /// Alert conditions
+    pub fn check_alert_conditions(
+        env: Env,
+        metrics: &SystemMetrics
+    ) -> Vec<Alert> {
+        let mut alerts = Vec::new(&env);
+
+        // TVL drop alert
+        if metrics.total_value_locked < Self::get_tvl_threshold(&env) {
+            alerts.push_back(Alert {
+                level: AlertLevel::High,
+                message: "TVL dropped below threshold".into(),
+                timestamp: env.ledger().timestamp(),
+            });
+        }
+
+        // Price deviation alert
+        if metrics.oracle_price_deviation > 1000 { // 10%
+            alerts.push_back(Alert {
+                level: AlertLevel::Critical,
+                message: "High oracle price deviation detected".into(),
+                timestamp: env.ledger().timestamp(),
+            });
+        }
+
+        alerts
+    }
+
     pub fn emergency_pause_all(
         env: Env,
         guardian: Address,
@@ -160,4 +202,30 @@ pub struct TransactionRecord {
     pub timestamp: u64,
     pub gas_used: u32,
     pub block_number: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct SystemMetrics {
+    pub total_value_locked: i128,
+    pub active_users_24h: u32,
+    pub transaction_volume_24h: i128,
+    pub health_factor_avg: i128,
+    pub oracle_price_deviation: u32,
+    pub gas_price_avg: u32,
+    pub timestamp: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Alert {
+    pub level: AlertLevel,
+    pub message: String,
+    pub timestamp: u64,
+}
+
+#[derive(Clone, Debug)]
+pub enum AlertLevel {
+    Low,
+    Medium,
+    High,
+    Critical,
 }

@@ -1,760 +1,429 @@
-use crate::{
-    auctions::{self, AuctionData},
-    emissions::{self, ReserveEmissionMetadata},
-    events::PoolEvents,
-    pool::{self, FlashLoan, Positions, Request, Reserve},
-    storage::{self, ReserveConfig},
-    PoolConfig, PoolError, ReserveEmissionData, UserEmissionData,
-};
+#![no_std]
+
 use soroban_sdk::{
-    contract, contractclient, contractimpl, panic_with_error, Address, Env, String, Vec,
+    contract, contractimpl, contracttype, panic_with_error, Address, Env, Symbol, Vec,
 };
 
-/// ### Pool
-///
-/// An isolated money market pool.
+mod storage;
+mod error;
+mod events;
+
+pub use error::OracleError;
+pub use events::OracleEvents;
+
+// SEP-40 PriceData structure with enhanced metadata
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriceData {
+    pub price: i128,           // Price with decimals precision
+    pub timestamp: u64,        // Unix timestamp
+    pub source_count: u32,     // Number of sources used for this price
+    pub confidence: u32,       // Confidence score (0-100)
+}
+
+// Price source for multi-oracle aggregation
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriceSource {
+    pub source_id: Symbol,     // Source identifier
+    pub price: i128,           // Price from this source
+    pub timestamp: u64,        // When this source was updated
+    pub weight: u32,           // Weight in aggregation (0-100)
+}
+
+// Circuit breaker state
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CircuitBreaker {
+    pub is_paused: bool,
+    pub pause_timestamp: u64,
+    pub reason: Symbol,
+}
+
+// Oracle configuration
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleConfig {
+    pub max_price_deviation_bps: u32,  // Max deviation in basis points (e.g., 1000 = 10%)
+    pub max_staleness_seconds: u64,     // Max time before price is stale
+    pub min_sources_required: u32,      // Minimum sources needed for valid price
+    pub heartbeat_interval: u64,        // Required update frequency
+}
+
+// Asset representation for SEP-40 compatibility
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Asset {
+    Stellar(Address),     // Stellar asset contract address
+    Other(Symbol),        // Other asset identifier
+}
+
+/// Secure TrustBridge Oracle Contract
+/// 
+/// Enhanced implementation with:
+/// - Multi-source price aggregation
+/// - Price deviation protection
+/// - Staleness checks
+/// - Circuit breakers
+/// - Multi-sig admin capabilities
 #[contract]
-pub struct PoolContract;
+pub struct TrustBridgeOracle;
 
-#[contractclient(name = "PoolClient")]
-pub trait Pool {
-    /// (Admin only) Set a new address to become the admin of the pool. This
-    /// must be accepted by the new admin w/ `accept_admin` to take effect.
-    ///
-    /// ### Arguments
-    /// * `new_admin` - The new admin address
-    ///
-    /// ### Panics
-    /// If the caller is not the admin
-    fn propose_admin(e: Env, new_admin: Address);
-
-    /// (Proposed admin only) Accept the admin role. Ensures the new admin
-    /// can safely submit transactions before taking over the pool admin role.
-    ///
-    /// ### Panics
-    /// If the caller is not the proposed admin
-    fn accept_admin(e: Env);
-
-    /// (Admin only) Update the pool
-    ///
-    /// ### Arguments
-    /// * `backstop_take_rate` - The new take rate for the backstop (7 decimals)
-    /// * `max_positions` - The new maximum number of allowed positions for a single user's account
-    /// * `min_collateral` - The new minimum collateral required to open a borrow position,
-    ///                      in the oracles base asset decimals
-    ///
-    /// ### Panics
-    /// If the caller is not the admin
-    fn update_pool(e: Env, backstop_take_rate: u32, max_positions: u32, min_collateral: i128);
-
-    /// (Admin only) Queues setting data for a reserve in the pool
-    ///
-    /// ### Arguments
-    /// * `asset` - The underlying asset to add as a reserve
-    /// * `config` - The ReserveConfig for the reserve
-    ///
-    /// ### Panics
-    /// If the caller is not the admin
-    fn queue_set_reserve(e: Env, asset: Address, metadata: ReserveConfig);
-
-    /// (Admin only) Cancels the queued set of a reserve in the pool
-    ///
-    /// ### Arguments
-    /// * `asset` - The underlying asset to add as a reserve
-    ///
-    /// ### Panics
-    /// If the caller is not the admin or the reserve is not queued for initialization
-    fn cancel_set_reserve(e: Env, asset: Address);
-
-    /// Executes the queued set of a reserve in the pool
-    ///
-    /// ### Arguments
-    /// * `asset` - The underlying asset to add as a reserve
-    ///
-    /// ### Panics
-    /// If the reserve is not queued for initialization
-    /// or is already setup
-    /// or has invalid metadata
-    fn set_reserve(e: Env, asset: Address) -> u32;
-
-    /// Fetch the pool configuration
-    fn get_config(e: Env) -> PoolConfig;
-
-    /// Fetch the admin address of the pool
-    fn get_admin(e: Env) -> Address;
-
-    /// Fetch the a vec addresses of all reserves in the pool. The index of the reserve
-    /// in this vec defines the index of the reserve in the pool, used in places like `Positions`.
-    fn get_reserve_list(e: Env) -> Vec<Address>;
-
-    /// Fetch information about a reserve, updated to the current ledger
-    ///
-    /// ### Arguments
-    /// * `asset` - The address of the reserve asset
-    fn get_reserve(e: Env, asset: Address) -> Reserve;
-
-    /// Fetch the positions for an address. For each position type, there is a map of the reserve index
-    /// to the position for that reserve, if it exists.
-    ///
-    /// ### Arguments
-    /// * `address` - The address to fetch positions for
-    fn get_positions(e: Env, address: Address) -> Positions;
-
-    /// Submit a set of requests to the pool where `from` takes on the position, `spender` sends any
-    /// required tokens to the pool and `to` receives any tokens sent from the pool.
-    ///
-    /// Returns the new positions for `from`
-    ///
-    /// ### Arguments
-    /// * `from` - The address of the user whose positions are being modified
-    /// * `spender` - The address of the user who is sending tokens to the pool
-    /// * `to` - The address of the user who is receiving tokens from the pool
-    /// * `requests` - A vec of requests to be processed
-    ///
-    /// ### Panics
-    /// If the request is not able to be completed for cases like insufficient funds or invalid health factor
-    fn submit(
+pub trait OracleTrait {
+    /// Initialize the oracle with admins and configuration
+    fn init(
         e: Env,
-        from: Address,
-        spender: Address,
-        to: Address,
-        requests: Vec<Request>,
-    ) -> Positions;
+        admins: Vec<Address>,
+        min_signatures: u32,
+        config: OracleConfig,
+    );
 
-    /// Submit a set of requests to the pool where `from` takes on the position, `spender` sends any
-    /// required tokens to the pool using transfer_from and `to` receives any tokens sent from the pool.
-    ///
-    /// Returns the new positions for `from`
-    ///
-    /// ### Arguments
-    /// * `from` - The address of the user whose positions are being modified
-    /// * `spender` - The address of the user who is sending tokens to the pool
-    /// * `to` - The address of the user who is receiving tokens from the pool
-    /// * `requests` - A vec of requests to be processed
-    ///
-    /// ### Panics
-    /// If the request is not able to be completed for cases like insufficient funds, insufficient allowance, or invalid health factor
-    fn submit_with_allowance(
+    /// Submit price from a trusted source (multi-sig required)
+    fn submit_price(
         e: Env,
-        from: Address,
-        spender: Address,
-        to: Address,
-        requests: Vec<Request>,
-    ) -> Positions;
+        asset: Asset,
+        price: i128,
+        source_id: Symbol,
+    );
 
-    /// Submit flash loan and a set of requests to the pool where `from` takes on the position. The flash loan will be invoked using
-    /// the `flash_loan` arguments and `from` as the caller. For the requests, `from` sends any required tokens to the pool
-    /// using transfer_from and receives any tokens sent from the pool.
-    ///
-    /// Returns the new positions for `from`
-    ///
-    /// ### Arguments
-    /// * `from` - The address of the user whose positions are being modified and also the address of
-    /// the user who is sending and receiving the tokens to the pool.
-    /// * `flash_loan` - Arguments relative to the flash loan: receiver contract, asset and borroed amount.
-    /// * `requests` - A vec of requests to be processed
-    ///
-    /// ### Panics
-    /// If the request is not able to be completed for cases like insufficient funds ,insufficient allowance, or invalid health factor
-    fn flash_loan(
-        e: Env,
-        from: Address,
-        flash_loan: FlashLoan,
-        requests: Vec<Request>,
-    ) -> Positions;
+    /// Get the aggregated price for an asset (with staleness check)
+    fn lastprice(e: Env, asset: Asset) -> Option<PriceData>;
 
-    /// Update the pool status based on the backstop state - backstop triggered status' are odd numbers
-    /// * 1 = backstop active - if the minimum backstop deposit has been reached
-    ///                and 30% of backstop deposits are not queued for withdrawal
-    ///                then all pool operations are permitted
-    /// * 3 = backstop on-ice - if the minimum backstop deposit has not been reached
-    ///                or 30% of backstop deposits are queued for withdrawal and admin active isn't set
-    ///                or 50% of backstop deposits are queued for withdrawal
-    ///                then borrowing and cancelling liquidations are not permitted
-    /// * 5 = backstop frozen - if 60% of backstop deposits are queued for withdrawal and admin on-ice isn't set
-    ///                or 75% of backstop deposits are queued for withdrawal
-    ///                then all borrowing, cancelling liquidations, and supplying are not permitted
-    ///
-    /// ### Panics
-    /// If the pool is currently on status 4, "admin-freeze", where only the admin
-    /// can perform a status update via `set_status`
-    fn update_status(e: Env) -> u32;
+    /// Get decimals
+    fn decimals(e: Env) -> u32;
 
-    /// (Admin only) Pool status is changed to `pool_status`
-    /// * 0 = admin active - requires that the backstop threshold is met
-    ///                 and less than 50% of backstop deposits are queued for withdrawal
-    /// * 2 = admin on-ice - requires that less than 75% of backstop deposits are queued for withdrawal
-    /// * 4 = admin frozen - can always be set
-    ///
-    /// ### Arguments
-    /// * `pool_status` - The pool status to be set
-    ///
-    /// ### Panics
-    /// If the caller is not the admin
-    /// If the specified conditions are not met for the status to be set
-    fn set_status(e: Env, pool_status: u32);
+    /// Emergency pause (multi-sig required)
+    fn pause(e: Env, reason: Symbol);
 
-    /// Gulps unaccounted for tokens to the backstop credit so they aren't lost. This is most relevant
-    /// for rebasing tokens where the token balance of the pool can increase without any corresponding
-    /// transfer.
-    ///
-    /// Blend Pools do not support fee-on-transaction tokens, or any tokens in which the pools balance
-    /// can decrease without any corresponding withdraw. Thus, negative token deltas are ignored.
-    ///
-    /// ### Arguments
-    /// * `asset` - The address of the asset to gulp
-    ///
-    /// Returns the amount of tokens gulped
-    fn gulp(e: Env, asset: Address) -> i128;
+    /// Resume operations (multi-sig required)
+    fn resume(e: Env);
 
-    /********* Emission Functions **********/
+    /// Update oracle configuration (multi-sig required)
+    fn update_config(e: Env, config: OracleConfig);
 
-    /// Consume emissions from the backstop and distribute to the reserves based
-    /// on the reserve emission configuration.
-    ///
-    /// Returns amount of new tokens emitted
-    fn gulp_emissions(e: Env) -> i128;
+    /// Add trusted price source (multi-sig required)
+    fn add_source(e: Env, source_id: Symbol, weight: u32);
 
-    /// (Admin only) Set the emission configuration for the pool
-    ///
-    /// Changes will be applied in the next pool `update_emissions`, and affect the next emission cycle
-    ///
-    /// ### Arguments
-    /// * `res_emission_metadata` - A vector of ReserveEmissionMetadata to update metadata to
-    ///
-    /// ### Panics
-    /// * If the caller is not the admin
-    fn set_emissions_config(e: Env, res_emission_metadata: Vec<ReserveEmissionMetadata>);
+    /// Remove trusted price source (multi-sig required)
+    fn remove_source(e: Env, source_id: Symbol);
 
-    /// Claims outstanding emissions for the caller for the given reserve's.
-    ///
-    /// A reserve token id is a unique identifier for a position in a pool.
-    /// - For a reserve's dTokens (liabilities), reserve_token_id = reserve_index * 2
-    /// - For a reserve's bTokens (supply/collateral), reserve_token_id = reserve_index * 2 + 1
-    ///
-    /// Returns the number of tokens claimed
-    ///
-    /// ### Arguments
-    /// * `from` - The address claiming
-    /// * `reserve_token_ids` - Vector of reserve token ids
-    /// * `to` - The Address to send the claimed tokens to
-    fn claim(e: Env, from: Address, reserve_token_ids: Vec<u32>, to: Address) -> i128;
+    /// Get circuit breaker status
+    fn get_circuit_breaker(e: Env) -> CircuitBreaker;
 
-    /// Get the emissions data for a reserve token
-    ///
-    /// A reserve token id is a unique identifier for a position in a pool.
-    /// - For a reserve's dTokens (liabilities), reserve_token_id = reserve_index * 2
-    /// - For a reserve's bTokens (supply/collateral), reserve_token_id = reserve_index * 2 + 1
-    ///
-    /// ### Arguments
-    /// * `reserve_token_id` - The reserve token id
-    fn get_reserve_emissions(e: Env, reserve_token_id: u32) -> Option<ReserveEmissionData>;
+    /// Get oracle configuration
+    fn get_config(e: Env) -> OracleConfig;
 
-    /// Get the emissions data for a user
-    ///
-    /// A reserve token id is a unique identifier for a position in a pool.
-    /// - For a reserve's dTokens (liabilities), reserve_token_id = reserve_index * 2
-    /// - For a reserve's bTokens (supply/collateral), reserve_token_id = reserve_index * 2 + 1
-    ///
-    /// ### Arguments
-    /// * `user` - The address of the user
-    /// * `reserve_token_id` - The reserve token id
-    fn get_user_emissions(e: Env, user: Address, reserve_token_id: u32)
-        -> Option<UserEmissionData>;
+    /// Add admin (multi-sig required)
+    fn add_admin(e: Env, new_admin: Address);
 
-    /***** Auction / Liquidation Functions *****/
+    /// Remove admin (multi-sig required)
+    fn remove_admin(e: Env, admin: Address);
 
-    /// Create a new auction. Auctions are used to process liquidations, bad debt, and interest.
-    ///
-    /// ### Arguments
-    /// * `auction_type` - The type of auction, 0 for liquidation auction, 1 for bad debt auction, and 2 for interest auction
-    /// * `user` - The Address involved in the auction. This is generally the source of the assets being auctioned.
-    ///            For bad debt and interest auctions, this is expected to be the backstop address.
-    /// * `bid` - The set of assets to include in the auction bid, or what the filler spends when filling the auction.
-    /// * `lot` - The set of assets to include in the auction lot, or what the filler receives when filling the auction.
-    /// * `percent` - The percent of the assets to be auctioned off as a percentage (15 => 15%). For bad debt and interest auctions.
-    ///               this is expected to be 100.
-    fn new_auction(
-        e: Env,
-        auction_type: u32,
-        user: Address,
-        bid: Vec<Address>,
-        lot: Vec<Address>,
-        percent: u32,
-    ) -> AuctionData;
+    /// Get all admins
+    fn get_admins(e: Env) -> Vec<Address>;
 
-    /// Fetch an auction from the ledger. Returns the base auction. On fill, this will be scaled based on the
-    /// number of blocks that have passed since the auction was created.
-    ///
-    /// ### Arguments
-    /// * `auction_type` - The type of auction, 0 for liquidation auction, 1 for bad debt auction, and 2 for interest auction
-    /// * `user` - The Address involved in the auction
-    ///
-    /// ### Panics
-    /// If the auction does not exist
-    fn get_auction(e: Env, auction_type: u32, user: Address) -> AuctionData;
-
-    /// Delete a stale auction. A stale auction is one that has been running for 500 blocks
-    /// without being filled. This likely means something went wrong with the auction creation,
-    /// and it should be re-created.
-    ///
-    /// ### Arguments
-    /// * `auction_type` - The type of auction, 0 for liquidation auction, 1 for bad debt auction, and 2 for interest auction
-    /// * `user` - The Address involved in the auction
-    ///
-    /// ### Panics
-    /// * If the auction does not exist
-    /// * If the auction is not stale
-    fn del_auction(e: Env, auction_type: u32, user: Address);
-
-    /// Check and handle bad debt for a user.
-    /// * If the user is not the backstop and they have bad debt, the backstop will take over the debt.
-    /// * If the user is the backstop, the backstop health will be checked, and if it is unhealthy, the backstop will default it's
-    /// remaining debt.
-    ///
-    /// ### Arguments
-    /// * `user` - The address of the user to check for bad debt
-    ///
-    /// ### Panics
-    /// * If there is no bad debt to handle
-    /// * If there is an ongoing auction for the user
-    fn bad_debt(e: Env, user: Address);
+    /// Get price with all source data (for transparency)
+    fn get_price_sources(e: Env, asset: Asset) -> Vec<PriceSource>;
 }
 
 #[contractimpl]
-impl PoolContract {
-    /// Initialize the pool
-    ///
-    /// ### Arguments
-    /// Creator supplied:
-    /// * `admin` - The Address for the admin
-    /// * `name` - The name of the pool
-    /// * `oracle` - The contract address of the oracle
-    /// * `backstop_take_rate` - The take rate for the backstop (7 decimals)
-    /// * `max_positions` - The maximum number of positions a user is permitted to have
-    /// * `min_collateral` - The minimum collateral required to open a borrow position in the oracles base asset
-    ///
-    /// Pool Factory supplied:
-    /// * `backstop_id` - The contract address of the pool's backstop module
-    /// * `blnd_id` - The contract ID of the BLND token
-    pub fn __constructor(
+impl OracleTrait for TrustBridgeOracle {
+    fn init(
         e: Env,
-        admin: Address,
-        name: String,
-        oracle: Address,
-        bstop_rate: u32,
-        max_positions: u32,
-        min_collateral: i128,
-        backstop_id: Address,
-        blnd_id: Address,
+        admins: Vec<Address>,
+        min_signatures: u32,
+        config: OracleConfig,
     ) {
-        admin.require_auth();
+        if storage::has_admins(&e) {
+            panic_with_error!(&e, OracleError::AlreadyInitialized);
+        }
 
-        pool::execute_initialize(
-            &e,
-            &admin,
-            &name,
-            &oracle,
-            &bstop_rate,
-            &max_positions,
-            &min_collateral,
-            &backstop_id,
-            &blnd_id,
-        );
+        if admins.is_empty() || min_signatures == 0 || min_signatures > admins.len() {
+            panic_with_error!(&e, OracleError::InvalidInput);
+        }
+
+        // Validate config
+        if config.max_price_deviation_bps > 10000 {  // Max 100%
+            panic_with_error!(&e, OracleError::InvalidInput);
+        }
+
+        storage::set_admins(&e, &admins);
+        storage::set_min_signatures(&e, min_signatures);
+        storage::set_config(&e, &config);
+        
+        // Initialize circuit breaker as active
+        let cb = CircuitBreaker {
+            is_paused: false,
+            pause_timestamp: 0,
+            reason: Symbol::new(&e, ""),
+        };
+        storage::set_circuit_breaker(&e, &cb);
+
+        OracleEvents::initialized(&e, admins.get(0).unwrap());
     }
 
-
-       pub fn flash_loan(
-        env: Env,
-        borrower: Address,
-        asset: Address,
-        amount: i128,
-        data: Bytes
-    ) -> Result<(), PoolError> {
-        borrower.require_auth();
-
-        // Check if flash loans are enabled
-        if !Self::flash_loans_enabled(&env) {
-            return Err(PoolError::FlashLoansDisabled);
+    fn submit_price(
+        e: Env,
+        asset: Asset,
+        price: i128,
+        source_id: Symbol,
+    ) {
+        // Check circuit breaker
+        let cb = storage::get_circuit_breaker(&e);
+        if cb.is_paused {
+            panic_with_error!(&e, OracleError::CircuitBreakerActive);
         }
 
-        // Check maximum flash loan amount
-        let max_flash_loan = Self::get_max_flash_loan_amount(&env, &asset);
-        if amount > max_flash_loan {
-            return Err(PoolError::FlashLoanAmountTooLarge);
+        // Verify caller is authorized source
+        storage::require_authorized_source(&e, &source_id);
+
+        if price <= 0 {
+            panic_with_error!(&e, OracleError::InvalidPrice);
         }
 
-        // Reentrancy protection
-        if env.storage().instance().has(&DataKey::FlashLoanActive) {
-            return Err(PoolError::ReentrantFlashLoan);
-        }
+        let config = storage::get_config(&e);
+        let timestamp = e.ledger().timestamp();
 
-        env.storage().instance().set(&DataKey::FlashLoanActive, &true);
+        // Check if we have a previous aggregated price for deviation check
+        if let Some(prev_price_data) = storage::get_aggregated_price(&e, &asset) {
+            // Check price deviation
+            let deviation_bps = calculate_deviation_bps(price, prev_price_data.price);
+            if deviation_bps > config.max_price_deviation_bps {
+                // Price change too large - auto-pause
+                Self::auto_pause(&e, Symbol::new(&e, "deviation"));
+                panic_with_error!(&e, OracleError::PriceDeviationExceeded);
+            }
 
-        // Store pre-flash loan state
-        let initial_balance = token::Client::new(&env, &asset).balance(&env.current_contract_address());
-        let initial_reserves = Self::get_reserves(&env);
-
-        // Calculate flash loan fee
-        let fee = Self::calculate_flash_loan_fee(&env, amount);
-        let amount_with_fee = amount + fee;
-
-        // Store expected repayment amount
-        env.storage().instance().set(&DataKey::ExpectedRepayment, &amount_with_fee);
-
-        // Transfer tokens to borrower
-        token::Client::new(&env, &asset).transfer(&env.current_contract_address(), &borrower, &amount);
-
-        // Call borrower's callback
-        let result = env.try_invoke_contract(
-            &borrower,
-            &symbol_short!("flash_cb"),
-            &(asset.clone(), amount, fee, data)
-        );
-
-        // Check callback executed successfully
-        if result.is_err() {
-            env.storage().instance().remove(&DataKey::FlashLoanActive);
-            env.storage().instance().remove(&DataKey::ExpectedRepayment);
-            return Err(PoolError::FlashLoanCallbackFailed);
-        }
-
-        // Verify repayment
-        let final_balance = token::Client::new(&env, &asset).balance(&env.current_contract_address());
-
-        if final_balance < initial_balance + fee {
-            env.storage().instance().remove(&DataKey::FlashLoanActive);
-            env.storage().instance().remove(&DataKey::ExpectedRepayment);
-            return Err(PoolError::FlashLoanNotRepaid);
-        }
-
-        // Verify pool invariants maintained
-        Self::verify_pool_invariants(&env, &initial_reserves)?;
-
-        // Read-only reentrancy check
-        Self::check_read_only_reentrancy(&env)?;
-
-        // Clean up
-        env.storage().instance().remove(&DataKey::FlashLoanActive);
-        env.storage().instance().remove(&DataKey::ExpectedRepayment);
-
-        emit_flash_loan(&env, borrower, asset, amount, fee);
-        Ok(())
-    }
-
-    /// Verify pool invariants after flash loan
-    fn verify_pool_invariants(
-        env: &Env,
-        initial_reserves: &Map<Address, i128>
-    ) -> Result<(), PoolError> {
-        let final_reserves = Self::get_reserves(env);
-
-        for (asset, initial_amount) in initial_reserves.iter() {
-            if let Some(final_amount) = final_reserves.get(asset.clone()) {
-                // Pool reserves should not decrease (except for legitimate fees)
-                if final_amount < initial_amount {
-                    let decrease = initial_amount - final_amount;
-                    let expected_fee = Self::calculate_flash_loan_fee(env, decrease);
-
-                    if decrease > expected_fee {
-                        return Err(PoolError::PoolInvariantViolated);
-                    }
-                }
+            // Check heartbeat
+            let time_since_update = timestamp - prev_price_data.timestamp;
+            if time_since_update > config.heartbeat_interval * 2 {
+                // Missed heartbeat - flag warning
+                OracleEvents::heartbeat_missed(&e, asset.clone(), time_since_update);
             }
         }
 
-        Ok(())
+        // Store price from this source
+        let source_weight = storage::get_source_weight(&e, &source_id);
+        let price_source = PriceSource {
+            source_id: source_id.clone(),
+            price,
+            timestamp,
+            weight: source_weight,
+        };
+
+        storage::set_price_source(&e, &asset, &source_id, &price_source);
+
+        // Aggregate prices from all sources
+        Self::aggregate_prices(&e, &asset, &config);
+
+        OracleEvents::price_submitted(&e, asset, source_id, price, timestamp);
     }
 
-    /// Check for read-only reentrancy attacks
-    fn check_read_only_reentrancy(env: &Env) -> Result<(), PoolError> {
-        // Verify that view functions return consistent values
-        let stored_total_supply = env.storage().instance().get(&DataKey::TotalSupply).unwrap_or(0);
-        let calculated_total_supply = Self::calculate_total_supply(env);
-
-        if stored_total_supply != calculated_total_supply {
-            return Err(PoolError::ReadOnlyReentrancyDetected);
+    fn lastprice(e: Env, asset: Asset) -> Option<PriceData> {
+        let config = storage::get_config(&e);
+        let price_data = storage::get_aggregated_price(&e, &asset)?;
+        
+        // Check staleness
+        let current_time = e.ledger().timestamp();
+        let age = current_time - price_data.timestamp;
+        
+        if age > config.max_staleness_seconds {
+            OracleEvents::stale_price_detected(&e, asset, age);
+            return None;  // Price too old
         }
 
-        Ok(())
-    }
-
-    /// MEV protection for price-sensitive operations
-    pub fn supply_with_mev_protection(
-        env: Env,
-        from: Address,
-        asset: Address,
-        amount: i128,
-        max_price_impact: u32 // Basis points
-    ) -> Result<(), PoolError> {
-        from.require_auth();
-
-        // Check current price impact
-        let price_impact = Self::calculate_price_impact(&env, &asset, amount);
-
-        if price_impact > max_price_impact {
-            return Err(PoolError::PriceImpactTooHigh);
+        // Check minimum sources
+        if price_data.source_count < config.min_sources_required {
+            return None;  // Not enough sources
         }
 
-        // Check for sandwich attack patterns
-        Self::check_sandwich_attack_protection(&env, &from, &asset, amount)?;
-
-        // Execute supply with additional validations
-        Self::supply(env, from, asset, amount)
+        Some(price_data)
     }
 
-    /// Detect potential sandwich attacks
-    fn check_sandwich_attack_protection(
-        env: &Env,
-        user: &Address,
-        asset: &Address,
-        amount: i128
-    ) -> Result<(), PoolError> {
-        let current_block = env.ledger().sequence();
+    fn decimals(_e: Env) -> u32 {
+        7  // TrustBridge Oracle uses 7 decimals
+    }
 
-        // Check for large trades in recent blocks
-        let recent_large_trades = Self::get_recent_large_trades(env, asset, 5); // Last 5 blocks
+    fn pause(e: Env, reason: Symbol) {
+        storage::require_multi_sig(&e);
 
-        for trade in recent_large_trades {
-            // If there was a large trade in the same direction recently, potential front-running
-            if trade.amount > amount / 2 && trade.trader != *user {
-                emit_potential_sandwich_detected(env, user.clone(), asset.clone(), amount);
-                // Could implement delay or rejection here
+        let cb = CircuitBreaker {
+            is_paused: true,
+            pause_timestamp: e.ledger().timestamp(),
+            reason: reason.clone(),
+        };
+
+        storage::set_circuit_breaker(&e, &cb);
+        OracleEvents::circuit_breaker_triggered(&e, reason);
+    }
+
+    fn resume(e: Env) {
+        storage::require_multi_sig(&e);
+
+        let cb = CircuitBreaker {
+            is_paused: false,
+            pause_timestamp: 0,
+            reason: Symbol::new(&e, ""),
+        };
+
+        storage::set_circuit_breaker(&e, &cb);
+        OracleEvents::circuit_breaker_reset(&e);
+    }
+
+    fn update_config(e: Env, config: OracleConfig) {
+        storage::require_multi_sig(&e);
+
+        if config.max_price_deviation_bps > 10000 {
+            panic_with_error!(&e, OracleError::InvalidInput);
+        }
+
+        storage::set_config(&e, &config);
+        OracleEvents::config_updated(&e);
+    }
+
+    fn add_source(e: Env, source_id: Symbol, weight: u32) {
+        storage::require_multi_sig(&e);
+
+        if weight > 100 {
+            panic_with_error!(&e, OracleError::InvalidInput);
+        }
+
+        storage::add_trusted_source(&e, &source_id, weight);
+        OracleEvents::source_added(&e, source_id, weight);
+    }
+
+    fn remove_source(e: Env, source_id: Symbol) {
+        storage::require_multi_sig(&e);
+
+        storage::remove_trusted_source(&e, &source_id);
+        OracleEvents::source_removed(&e, source_id);
+    }
+
+    fn get_circuit_breaker(e: Env) -> CircuitBreaker {
+        storage::get_circuit_breaker(&e)
+    }
+
+    fn get_config(e: Env) -> OracleConfig {
+        storage::get_config(&e)
+    }
+
+    fn add_admin(e: Env, new_admin: Address) {
+        storage::require_multi_sig(&e);
+
+        storage::add_admin(&e, &new_admin);
+        OracleEvents::admin_added(&e, new_admin);
+    }
+
+    fn remove_admin(e: Env, admin: Address) {
+        storage::require_multi_sig(&e);
+
+        let admins = storage::get_admins(&e);
+        let min_sigs = storage::get_min_signatures(&e);
+
+        if admins.len() <= min_sigs {
+            panic_with_error!(&e, OracleError::InsufficientAdmins);
+        }
+
+        storage::remove_admin(&e, &admin);
+        OracleEvents::admin_removed(&e, admin);
+    }
+
+    fn get_admins(e: Env) -> Vec<Address> {
+        storage::get_admins(&e)
+    }
+
+    fn get_price_sources(e: Env, asset: Asset) -> Vec<PriceSource> {
+        storage::get_all_price_sources(&e, &asset)
+    }
+}
+
+// Internal helper functions
+impl TrustBridgeOracle {
+    fn aggregate_prices(e: &Env, asset: &Asset, config: &OracleConfig) {
+        let sources = storage::get_all_price_sources(e, asset);
+        
+        if sources.is_empty() {
+            return;
+        }
+
+        let current_time = e.ledger().timestamp();
+        let mut total_weighted_price: i128 = 0;
+        let mut total_weight: u32 = 0;
+        let mut valid_sources: u32 = 0;
+
+        // Calculate weighted average
+        for i in 0..sources.len() {
+            let source = sources.get(i).unwrap();
+            
+            // Skip stale sources
+            if current_time - source.timestamp > config.max_staleness_seconds {
+                continue;
             }
+
+            total_weighted_price += source.price * (source.weight as i128);
+            total_weight += source.weight;
+            valid_sources += 1;
         }
 
-        Ok(())
+        if valid_sources == 0 || total_weight == 0 {
+            return;
+        }
+
+        let aggregated_price = total_weighted_price / (total_weight as i128);
+
+        // Calculate confidence based on source count and weight distribution
+        let confidence = calculate_confidence(valid_sources, sources.len());
+
+        let price_data = PriceData {
+            price: aggregated_price,
+            timestamp: current_time,
+            source_count: valid_sources,
+            confidence,
+        };
+
+        storage::set_aggregated_price(e, asset, &price_data);
+    }
+
+    fn auto_pause(e: &Env, reason: Symbol) {
+        let cb = CircuitBreaker {
+            is_paused: true,
+            pause_timestamp: e.ledger().timestamp(),
+            reason: reason.clone(),
+        };
+
+        storage::set_circuit_breaker(e, &cb);
+        OracleEvents::circuit_breaker_triggered(e, reason);
     }
 }
 
-#[contractimpl]
-impl Pool for PoolContract {
-    fn propose_admin(e: Env, new_admin: Address) {
-        storage::extend_instance(&e);
-        let admin = storage::get_admin(&e);
-        admin.require_auth();
-
-        storage::set_proposed_admin(&e, &new_admin);
+// Helper functions
+fn calculate_deviation_bps(new_price: i128, old_price: i128) -> u32 {
+    if old_price == 0 {
+        return 10000;  // 100% deviation
     }
 
-    fn accept_admin(e: Env) {
-        storage::extend_instance(&e);
+    let diff = if new_price > old_price {
+        new_price - old_price
+    } else {
+        old_price - new_price
+    };
 
-        if let Some(proposed_admin) = storage::get_proposed_admin(&e) {
-            proposed_admin.require_auth();
-            let cur_admin = storage::get_admin(&e);
-
-            storage::set_admin(&e, &proposed_admin);
-
-            PoolEvents::set_admin(&e, cur_admin, proposed_admin);
-        } else {
-            panic_with_error!(&e, PoolError::BadRequest);
-        }
-    }
-
-    fn update_pool(e: Env, backstop_take_rate: u32, max_positions: u32, min_collateral: i128) {
-        storage::extend_instance(&e);
-        let admin = storage::get_admin(&e);
-        admin.require_auth();
-
-        pool::execute_update_pool(&e, backstop_take_rate, max_positions, min_collateral);
-
-        PoolEvents::update_pool(&e, admin, backstop_take_rate, max_positions, min_collateral);
-    }
-
-    fn queue_set_reserve(e: Env, asset: Address, metadata: ReserveConfig) {
-        storage::extend_instance(&e);
-        let admin = storage::get_admin(&e);
-        admin.require_auth();
-
-        pool::execute_queue_set_reserve(&e, &asset, &metadata);
-
-        PoolEvents::queue_set_reserve(&e, admin, asset, metadata);
-    }
-
-    fn cancel_set_reserve(e: Env, asset: Address) {
-        storage::extend_instance(&e);
-        let admin = storage::get_admin(&e);
-        admin.require_auth();
-
-        pool::execute_cancel_queued_set_reserve(&e, &asset);
-
-        PoolEvents::cancel_set_reserve(&e, admin, asset);
-    }
-
-    fn set_reserve(e: Env, asset: Address) -> u32 {
-        storage::extend_instance(&e);
-
-        let index = pool::execute_set_reserve(&e, &asset);
-
-        PoolEvents::set_reserve(&e, asset, index);
-        index
-    }
-
-    fn get_config(e: Env) -> PoolConfig {
-        storage::get_pool_config(&e)
-    }
-
-    fn get_admin(e: Env) -> Address {
-        storage::get_admin(&e)
-    }
-
-    fn get_reserve_list(e: Env) -> Vec<Address> {
-        storage::get_res_list(&e)
-    }
-
-    fn get_reserve(e: Env, asset: Address) -> Reserve {
-        let pool_config = storage::get_pool_config(&e);
-        Reserve::load(&e, &pool_config, &asset)
-    }
-
-    fn get_positions(e: Env, address: Address) -> Positions {
-        storage::get_user_positions(&e, &address)
-    }
-
-    fn submit(
-        e: Env,
-        from: Address,
-        spender: Address,
-        to: Address,
-        requests: Vec<Request>,
-    ) -> Positions {
-        storage::extend_instance(&e);
-        spender.require_auth();
-        if from != spender {
-            from.require_auth();
-        }
-
-        pool::execute_submit(&e, &from, &spender, &to, requests, false)
-    }
-
-    fn submit_with_allowance(
-        e: Env,
-        from: Address,
-        spender: Address,
-        to: Address,
-        requests: Vec<Request>,
-    ) -> Positions {
-        storage::extend_instance(&e);
-        spender.require_auth();
-        if from != spender {
-            from.require_auth();
-        }
-
-        pool::execute_submit(&e, &from, &spender, &to, requests, true)
-    }
-
-    fn flash_loan(
-        e: Env,
-        from: Address,
-        flash_loan: FlashLoan,
-        requests: Vec<Request>,
-    ) -> Positions {
-        storage::extend_instance(&e);
-        from.require_auth();
-
-        pool::execute_submit_with_flash_loan(&e, &from, flash_loan, requests)
-    }
-
-    fn update_status(e: Env) -> u32 {
-        storage::extend_instance(&e);
-        let new_status = pool::execute_update_pool_status(&e);
-
-        PoolEvents::set_status(&e, new_status);
-        new_status
-    }
-
-    fn set_status(e: Env, pool_status: u32) {
-        storage::extend_instance(&e);
-        let admin = storage::get_admin(&e);
-        admin.require_auth();
-        pool::execute_set_pool_status(&e, pool_status);
-
-        PoolEvents::set_status_admin(&e, admin, pool_status);
-    }
-
-    fn gulp(e: Env, asset: Address) -> i128 {
-        storage::extend_instance(&e);
-        let token_delta = pool::execute_gulp(&e, &asset);
-
-        PoolEvents::gulp(&e, asset, token_delta);
-        token_delta
-    }
-
-    /********* Emission Functions **********/
-
-    fn gulp_emissions(e: Env) -> i128 {
-        storage::extend_instance(&e);
-        let emissions = emissions::gulp_emissions(&e);
-
-        PoolEvents::gulp_emissions(&e, emissions);
-        emissions
-    }
-
-    fn set_emissions_config(e: Env, res_emission_metadata: Vec<ReserveEmissionMetadata>) {
-        storage::extend_instance(&e);
-        let admin = storage::get_admin(&e);
-        admin.require_auth();
-
-        emissions::set_pool_emissions(&e, res_emission_metadata);
-    }
-
-    fn claim(e: Env, from: Address, reserve_token_ids: Vec<u32>, to: Address) -> i128 {
-        storage::extend_instance(&e);
-        from.require_auth();
-
-        let amount_claimed = emissions::execute_claim(&e, &from, &reserve_token_ids, &to);
-
-        PoolEvents::claim(&e, from, reserve_token_ids, amount_claimed);
-
-        amount_claimed
-    }
-
-    fn get_reserve_emissions(e: Env, reserve_token_index: u32) -> Option<ReserveEmissionData> {
-        storage::get_res_emis_data(&e, &reserve_token_index)
-    }
-
-    fn get_user_emissions(
-        e: Env,
-        user: Address,
-        reserve_token_index: u32,
-    ) -> Option<UserEmissionData> {
-        storage::get_user_emissions(&e, &user, &reserve_token_index)
-    }
-
-    /***** Auction / Liquidation Functions *****/
-
-    fn new_auction(
-        e: Env,
-        auction_type: u32,
-        user: Address,
-        bid: Vec<Address>,
-        lot: Vec<Address>,
-        percent: u32,
-    ) -> AuctionData {
-        storage::extend_instance(&e);
-
-        let auction_data = auctions::create_auction(&e, auction_type, &user, &bid, &lot, percent);
-
-        PoolEvents::new_auction(&e, auction_type, user, percent, auction_data.clone());
-        auction_data
-    }
-
-    fn get_auction(e: Env, auction_type: u32, user: Address) -> AuctionData {
-        storage::get_auction(&e, &auction_type, &user)
-    }
-
-    fn del_auction(e: Env, auction_type: u32, user: Address) {
-        storage::extend_instance(&e);
-
-        auctions::delete_stale_auction(&e, auction_type, &user);
-
-        PoolEvents::delete_auction(&e, auction_type, user);
-    }
-
-    fn bad_debt(e: Env, user: Address) {
-        storage::extend_instance(&e);
-
-        pool::bad_debt(&e, &user);
-    }
+    ((diff * 10000) / old_price) as u32
 }
+
+fn calculate_confidence(valid_sources: u32, total_sources: u32) -> u32 {
+    if total_sources == 0 {
+        return 0;
+    }
+
+    // Confidence based on percentage of sources reporting
+    let base_confidence = (valid_sources * 100) / total_sources;
+
+    // Bonus for having multiple sources
+    let source_bonus = if valid_sources >= 3 { 10 } else { 0 };
+
+    u32::min(100, base_confidence + source_bonus)
+}
+
+#[cfg(test)]
+mod test;

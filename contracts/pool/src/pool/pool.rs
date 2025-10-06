@@ -29,6 +29,42 @@ impl Pool {
             price_decimals: None,
             prices: map![e],
         }
+
+    pub fn batch_operations(
+        env: Env,
+        user: Address,
+        operations: Vec<PoolOperation>
+    ) -> Result<Vec<PoolResult>, PoolError> {
+        user.require_auth();
+
+        let mut results = Vec::new(&env);
+
+        // Validate all operations first
+        for operation in &operations {
+            Self::validate_operation(&env, &user, operation)?;
+        }
+
+        // Execute all operations
+        for operation in operations {
+            let result = match operation {
+                PoolOperation::Supply { asset, amount } => {
+                    Self::supply(env.clone(), user.clone(), asset, amount)?;
+                    PoolResult::Supply { success: true }
+                },
+                PoolOperation::Borrow { asset, amount } => {
+                    Self::borrow(env.clone(), user.clone(), asset, amount)?;
+                    PoolResult::Borrow { success: true }
+                },
+                PoolOperation::Repay { asset, amount } => {
+                    Self::repay(env.clone(), user.clone(), asset, amount)?;
+                    PoolResult::Repay { success: true }
+                },
+            };
+            results.push_back(result);
+        }
+
+            Ok(results)
+        }
     }
 
     /// Load a Reserve from the ledger and update to the current ledger timestamp. Returns
@@ -872,5 +908,20 @@ mod tests {
 
             pool.require_under_max(&e, &user.positions, prev_positions);
         });
+    }
+
+
+    #[derive(Clone, Debug)]
+    pub enum PoolOperation {
+        Supply { asset: Address, amount: i128 },
+        Borrow { asset: Address, amount: i128 },
+        Repay { asset: Address, amount: i128 },
+    }
+
+    #[derive(Clone, Debug)]
+    pub enum PoolResult {
+        Supply { success: bool },
+        Borrow { success: bool },
+        Repay { success: bool },
     }
 }
